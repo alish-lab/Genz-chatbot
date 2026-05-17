@@ -14,12 +14,15 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOTENV_PATH = os.path.join(BASE_DIR, ".env")
+if not os.path.exists(DOTENV_PATH):
+    print(f"[WARN] No .env file found at {DOTENV_PATH}. Create one from .env.example if needed.")
+load_dotenv(dotenv_path=DOTENV_PATH)
 
 app = Flask(__name__)
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR  = os.path.join(BASE_DIR, "models")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model globals
@@ -41,6 +44,17 @@ MAX_LEN = 50
 
 def _path(filename: str) -> str:
     return os.path.join(MODEL_DIR, filename)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state (in-memory, single user)
+# ─────────────────────────────────────────────────────────────────────────────
+SESSION_STATE = {
+    "history":        [],     # last 5 raw user messages
+    "previous_intent": None,  # intent from the prior turn
+    "active_topic":   None,   # e.g. "studying" — persists across turns
+    "topic_turns":    0,      # countdown before active_topic resets
+}
 
 
 def load_models():
@@ -111,8 +125,12 @@ def predict_emotion(processed_text: str) -> str:
     return "neutral"
 
 
-def predict_sentiment(processed_text: str, emotion: str) -> str:
-    """Run LSTM sentiment model; fallback to emotion→sentiment mapping."""
+def predict_sentiment(processed_text: str, emotion: str, intent: str = None) -> str:
+    """Run LSTM sentiment model; fallback to emotion→sentiment mapping.
+
+    If intent is 'studying', bias toward `neutral` unless clear distress keywords
+    are present in the processed text.
+    """
     if sentiment_model and sentiment_tokenizer and sentiment_le:
         try:
             X = _seq_pad(sentiment_tokenizer, processed_text)
@@ -120,23 +138,33 @@ def predict_sentiment(processed_text: str, emotion: str) -> str:
             return sentiment_le.inverse_transform([np.argmax(probs)])[0]
         except Exception as e:
             print(f"[WARN] Sentiment predict error: {e}")
-    # Fallback
+
+    # Fallback mapping
     mapping = {
         "joy": "positive", "surprise": "positive",
         "sadness": "negative", "anger": "negative", "fear": "negative",
         "neutral": "neutral",
     }
-    return mapping.get(emotion, "neutral")
+    fallback = mapping.get(emotion, "neutral")
+
+    # If the user's intent is studying, avoid classifying as negative unless
+    # the processed text contains clear distress indicators.
+    if intent == "studying" and fallback == "negative":
+        distress_keywords = ["stress", "stressed", "overwhelm", "overwhelmed",
+                             "panic", "anxious", "scared", "scary", "terrible"]
+        if not any(k in processed_text for k in distress_keywords):
+            return "neutral"
+
+    return fallback
 
 
 def predict_intent(processed_text: str, raw_message: str) -> str:
-    """TF-IDF + Logistic Regression intent prediction with Context Awareness."""
-    
-    # 1. Context Override Rules
-    study_keywords = ["quiz", "exam", "study", "assignment", "tomorrow"]
+
+    # Context override — only trigger on explicit study keywords
+    study_keywords = ["quiz", "exam", "study", "assignment", "homework", "test"]
     if any(word in raw_message.lower() for word in study_keywords):
         return "studying"
-        
+
     if intent_vectorizer and intent_clf and intent_le:
         try:
             X = intent_vectorizer.transform([processed_text])
@@ -144,19 +172,22 @@ def predict_intent(processed_text: str, raw_message: str) -> str:
             max_prob = np.max(probs)
             pred_idx = np.argmax(probs)
             predicted_intent = intent_le.inverse_transform([pred_idx])[0]
-            
-            # 2. Intent Persistence
+
+            # FIXED: only persist studying if confidence is LOW
+            # AND the new message is study-adjacent, not random
             if max_prob < 0.65 and SESSION_STATE["active_topic"] == "studying":
-                return "studying"
-                
+                # Check if message is at least somewhat related
+                study_adjacent = ["help", "understand", "explain", "concept", "learn"]
+                if any(w in raw_message.lower() for w in study_adjacent):
+                    return "studying"
+                # Otherwise let it go — user moved on
+                return predicted_intent
+
             return predicted_intent
+
         except Exception as e:
             print(f"[WARN] Intent predict error: {e}")
-            
-    # 3. Fallback to previous intent if available
-    if SESSION_STATE["active_topic"] == "studying":
-        return "studying"
-        
+
     return "general"
 
 
@@ -175,7 +206,22 @@ def chat():
     raw_message = data.get("message", "").strip()
     if not raw_message:
         return jsonify({"response": "Say something! I'm all ears 👀"}), 200
-
+    # ── Persona extraction from prefix hints ─────────────────────
+    persona = None
+    normalized = raw_message.strip()
+    for prefix, value in [
+        ("roast me:", "roast"),
+        ("roast:", "roast"),
+        ("hype me up:", "hype"),
+        ("hype:", "hype"),
+        ("vibe check:", "vibe"),
+        ("vibe me:", "vibe"),
+        ("vibe:", "vibe"),
+    ]:
+        if normalized.lower().startswith(prefix):
+            persona = value
+            raw_message = normalized[len(prefix):].strip()
+            break
     # ── NLP Pipeline ──────────────────────────────────────────────────────────
     from preprocess import run_pipeline
     pipeline_out = run_pipeline(raw_message)
@@ -184,8 +230,10 @@ def chat():
     emoji_emos  = pipeline_out["emoji_emotions"]   # [(emoji, emotion), ...]
 
     emotion    = predict_emotion(processed)
-    sentiment  = predict_sentiment(processed, emotion)
     intent     = predict_intent(processed, raw_message)
+    sentiment  = predict_sentiment(processed, emotion, intent)
+    from response_generator import _detect_grief
+    is_grief   = _detect_grief(raw_message)
 
     # ── State Management ──────────────────────────────────────────────────────
     # Append to history
@@ -195,15 +243,28 @@ def chat():
         
     SESSION_STATE["previous_intent"] = intent
     
-    # Topic continuity
+        # ── Topic continuity — FIXED ──────────────────────────────────
     if intent == "studying":
         SESSION_STATE["active_topic"] = "studying"
-        SESSION_STATE["topic_turns"] = 3
+        SESSION_STATE["topic_turns"] = 2  # reduced from 3
+
+    elif intent in ("general", "greeting", "jokes"):
+        # These intents always clear the active topic
+        SESSION_STATE["active_topic"] = None
+        SESSION_STATE["topic_turns"] = 0
+
     else:
+        # Emotional support, anger etc also clear topic
         if SESSION_STATE["topic_turns"] > 0:
             SESSION_STATE["topic_turns"] -= 1
         if SESSION_STATE["topic_turns"] == 0:
             SESSION_STATE["active_topic"] = None
+
+    # Grief always nukes topic
+    if is_grief:
+        SESSION_STATE["active_topic"] = None
+        SESSION_STATE["topic_turns"] = 0
+        SESSION_STATE["previous_intent"] = "emotional_support"
 
     # Emoji emotion override (if strong signal present)
     if emoji_emos:
@@ -216,21 +277,24 @@ def chat():
 
     # ── Generate response ─────────────────────────────────────────────────────
     from response_generator import generate_response
-    response_text = generate_response(
+    response_text, meta = generate_response(
         message        = raw_message,
         emotion        = emotion,
         sentiment      = sentiment,
         intent         = intent,
+        persona        = persona,
         history        = SESSION_STATE["history"],
         tokens         = pipeline_out.get("tokens", []),
         emoji_emotions = emoji_emos,
     )
 
     return jsonify({
-        "response":  response_text,
-        "emotion":   emotion,
-        "sentiment": sentiment,
-        "intent":    intent,
+        "response":      response_text,
+        "emotion":       emotion,
+        "sentiment":     sentiment,
+        "intent":        intent,
+        "sanitized":     meta.get("sanitized", False),
+        "slang_injected": meta.get("slang_injected", None),
     })
 
 
@@ -242,10 +306,15 @@ def check_groq_connection():
     print("Testing Groq API connection...")
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
-        print("[FAILED] Groq API is NOT connected. Reason: No API key found in .env file.")
+        print("[WARN] Groq API key is missing. The app will run in local fallback mode.")
         return
     try:
-        from groq import Groq
+        try:
+            from groq import Groq
+        except ImportError:
+            print("[WARN] Groq SDK is not installed. Install it only if you want Groq-based chat completions.")
+            return
+
         client = Groq(api_key=api_key)
         client.chat.completions.create(
             messages=[{"role": "user", "content": "ping"}],
@@ -254,7 +323,7 @@ def check_groq_connection():
         )
         print("[SUCCESS] Groq API connected successfully! Dynamic responses are active.")
     except Exception as e:
-        print(f"[FAILED] Groq API is NOT connected. Reason: {e}")
+        print(f"[WARN] Groq API is not connected. Reason: {e}")
 
 if __name__ == "__main__":
     load_models()

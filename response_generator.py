@@ -34,6 +34,20 @@ REVERSE_SLANG_MAP = _build_reverse_slang_map(SLANG_MAP)
 from groq_service import generate_ai_response
 from retrieval import get_top_genz_examples
 
+from preprocess import (
+    _load_slang_map,
+    _build_reverse_slang_map,
+    apply_genz_translation,
+    get_real_slang_for_prompt,
+    get_emoji_for_context,      # add this
+    get_synthetic_examples,
+)
+
+# Load once at startup
+SLANG_MAP         = _load_slang_map()
+REVERSE_SLANG_MAP = _build_reverse_slang_map(SLANG_MAP)
+FULL_SLANG_PROMPT = get_real_slang_for_prompt()  # add this
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Grief / loss trigger phrases (NLP rule — runs before LLM)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +91,55 @@ FALLBACK = {
                           "lowkey I have thoughts on this. what's your take?"],
 }
 
+SLANG_USAGE_GUIDE = """
+SLANG SEMANTIC RULES — only use a term if the meaning fits:
+
+say less    → means "understood, got it, no need to explain"
+             ONLY use when acknowledging something the user explained
+             NEVER use as a filler or question ending
+             WRONG: "what subject is it, say less?"
+             RIGHT: "say less, let's get into it"
+
+locked in   → means "fully focused, in the zone"
+             use when encouraging focus or study mode
+             RIGHT: "let's get locked in fr"
+
+cooked      → means "in trouble, overwhelmed, failed"
+             use when situation is bad or difficult
+             RIGHT: "we are so cooked for this exam 😭"
+
+lowkey      → means "subtly, quietly, a little bit"
+             use to soften an opinion
+             RIGHT: "lowkey recursion is actually interesting"
+
+ngl         → means "not gonna lie, being honest"
+             use before an honest opinion
+             RIGHT: "ngl that quiz sounds rough"
+
+fr          → means "for real, seriously"
+             use to emphasize something genuine
+             RIGHT: "that's tough fr"
+
+W           → means "win, good outcome"
+             use only for genuinely positive things
+             RIGHT: "that's actually a W"
+
+no cap      → means "no lie, seriously"
+             use to emphasize honesty
+             RIGHT: "no cap this is important"
+
+aura        → means "someone's vibe or energy"
+             use for personality or vibe descriptions
+             RIGHT: "the aura of recursion is just calling itself"
+
+cooked      → means "in trouble or overwhelmed"
+             RIGHT: "we're cooked if we don't start now"
+
+bet         → means "okay, sounds good, agreed"
+             use as affirmation
+             RIGHT: "bet, let's do this"
+"""
+
 def _fallback(emotion: str, intent: str, is_grief: bool) -> str:
     if is_grief:
         return random.choice(FALLBACK["grief"])
@@ -101,10 +164,10 @@ def _build_system_prompt(emotion: str, sentiment: str, intent: str,
 
     # ── Core persona ───────────────────────────────────────────────────────
     persona = """You are an empathetic, helpful AI bestie.
-You were built on a full NLP pipeline: your understanding of this message
-comes from emotion detection, sentiment analysis, intent classification,
-slang normalization, acronym expansion, and emoji interpretation.
-Use that understanding — not surface-level keyword matching — to respond."""
+    You were built on a full NLP pipeline: your understanding of this message
+    comes from emotion detection, sentiment analysis, intent classification,
+    slang normalization, acronym expansion, and emoji interpretation.
+    Use that understanding — not surface-level keyword matching — to respond."""
 
     # ── Tone rules derived from NLP outputs ───────────────────────────────
     tone_rules = []
@@ -122,12 +185,6 @@ Use that understanding — not surface-level keyword matching — to respond."""
             "Use gentle, natural language. Light Gen Z tone is okay but no excessive hype.",
             "Do not minimize their feelings. Make them feel heard.",
         ]
-    elif emotion == "anger":
-        tone_rules += [
-            "The NLP model detected ANGER. Stay calm and listen-first.",
-            "Acknowledge the frustration before anything else.",
-            "No jokes. No hype. Just understanding.",
-        ]
     elif emotion == "fear":
         tone_rules += [
             "The NLP model detected FEAR or ANXIETY. Be reassuring.",
@@ -139,6 +196,13 @@ Use that understanding — not surface-level keyword matching — to respond."""
             "The NLP model detected JOY or positive energy. Match it!",
             "Be enthusiastic, fun, upbeat.",
             "Use standard English. Your response will be translated to slang later.",
+        ]
+    elif emotion == "anger":
+        tone_rules += [
+            "The user expressed frustration or anger. Stay calm and SHORT.",
+            "Do NOT lecture or moralize.",
+            "Do NOT reference previous topics.",
+            "1-2 sentences max. Acknowledge and move on.",
         ]
     else:
         tone_rules += [
@@ -190,16 +254,26 @@ Use that understanding — not surface-level keyword matching — to respond."""
 
     # ── Hard rules (always enforced) ──────────────────────────────────────
     hard_rules = [
-        "NEVER mention emotion labels, sentiment scores, or intent classifications in your response.",
+      
+        "NEVER mention emotion labels, sentiment scores, or intent classifications.",
         "NEVER say 'I detected that you are...' or 'Based on your sentiment...'",
-        "NEVER say 'I saw you mentioned...'",
-        "NEVER combine multiple response templates.",
+        "NEVER drag the conversation back to a previous topic the user has moved on from.",
+        "NEVER reference recursion, studying, or any prior topic unless the user brings it up.",
+        "If the user says something unrelated to the previous topic, just respond to what they said.",
         "NEVER be robotic or formal unless explaining something technical.",
-        "Keep responses conversational — 1 to 4 sentences max unless explaining something.",
-        "Write in clear, standard English. Do NOT use slang yet. Focus entirely on being helpful and empathetic.",
-        "Use emojis MODERATELY — 0 to 2 per response max.",
-        "Sound human. Sound like a real person who gets it.",
+        "Keep responses 1 to 4 sentences max unless explaining something complex.",
+        "Write in clear standard English. The response will be styled afterward.",
+        "Use 0 to 2 emojis max.",
+        "Sound like a real person. Not a tutor. Not a therapist. A smart friend.",
+        "If the user expresses frustration or anger toward you, stay calm and brief. Do not lecture.",
+        "If the user talks about their social life, friends, or personal life, engage with THAT topic.",
+        "NEVER speak as if you ARE the user. You are responding TO the user.",
+        "NEVER say 'I have a quiz' or 'I need help' — those are the user's words not yours.",
+        "NEVER start a response with 'I' unless you are expressing your own opinion.",
+        "NEVER repeat back what the user said as if it is your own situation.",
+        "You are an AI assistant responding to the user. Always maintain that perspective.",
     ]
+    
 
     # ── Assemble ──────────────────────────────────────────────────────────
     system = persona + "\n\n"
@@ -237,61 +311,209 @@ def rewrite_genz(
     groq_response: str,
     intent: str,
     emotion: str,
-    retrieved_examples: str
+    retrieved_examples: str,
+    selected_emoji: str = "",       # add this
+    persona: str = None,
+    synthetic_examples: str = "",
 ) -> str:
-    """Builds the Gen-Z style rewrite prompt using retrieved examples and strict rules."""
-    
-    # ── Emotional matching rules ──
+
     emotion_rules = ""
     if emotion == "sadness":
-        emotion_rules = "Emotion is SAD: Be gentle, supportive, and use fewer jokes."
+        emotion_rules = (
+            "Emotion is SAD or GRIEF: be human first, drop everything else.\n"
+            "NO slang. NO emoji except 😭 if it fits naturally.\n"
+            "Short, warm, real. Sound like a friend who actually cares."
+        )
     elif emotion == "anger":
-        emotion_rules = "Emotion is ANGER: Stay calm, validate their frustration, do not match the anger."
+        emotion_rules = (
+            "Emotion is ANGER: validate first, stay calm.\n"
+            "No jokes. No hype. Pick grounding slang only if natural: fr, ngl, deadass."
+        )
     elif emotion in ("joy", "surprise"):
-        emotion_rules = "Emotion is JOY: Use high energy and hype them up."
+        emotion_rules = (
+            "Emotion is JOY: match the energy.\n"
+            "Pick high-energy slang from the dataset: W, bussin, slay, goated, no cap, fire.\n"
+            "Pair with 🔥 or 💀 only if it genuinely fits."
+        )
     elif emotion == "fear":
-        emotion_rules = "Emotion is STRESS/FEAR: Be reassuring and grounded."
-        
-    # ── Intent matching rules ──
+        emotion_rules = (
+            "Emotion is STRESS/FEAR: calm and reassuring tone.\n"
+            "Pick grounding slang: lowkey, ngl, locked in, fr, clutch.\n"
+            "Slightly humorous only if it eases tension naturally."
+        )
+    else:
+        emotion_rules = (
+            "Emotion is NEUTRAL: casual smart-friend energy.\n"
+            "Pick any slang from the dataset that fits the sentence meaning.\n"
+            "Never pick slang just to seem Gen-Z — it must fit naturally."
+        )
+
     intent_rules = ""
     if intent == "greeting":
         intent_rules = (
-            "Intent is GREETING: Keep it extremely short.\n"
-            "Examples:\n"
-            "User: hi -> Bot: yooo what's up 👋\n"
-            "User: hello -> Bot: heyy what we on today\n"
-            "User: hey -> Bot: ayo hi 😭"
+            "Intent is GREETING: 1 sentence max, punchy opener.\n"
+            "Examples of good rhythm:\n"
+            "- ayo what's the vibe today 👀\n"
+            "- okay bet, what are we on\n"
+            "- heyy what's good fr"
         )
     elif intent == "studying":
         intent_rules = (
-            "Intent is STUDYING: Become a study buddy.\n"
-            "Examples:\n"
-            "User: quiz tomorrow -> Bot: quiz tomorrow? 😭 what subject are we fighting\n"
-            "User: exam stress -> Bot: aight pause 😭 what topic got you stressed\n"
-            "User: quiz tomorrow -> Bot: nah quizzes always spawn at the worst time 😭"
+            "Intent is STUDYING: study buddy energy. Clear explanation first, Gen-Z second.\n"
+            "Examples of good rhythm:\n"
+            "- ngl recursion is actually a W concept once it clicks\n"
+            "- okay so the base case is literally the only exit, no cap\n"
+            "- we are so locked in rn 😭 what part is cooked for you\n"
+            "- lowkey once you see the pattern it all makes sense fr\n"
+            "- the aura of recursion is just calling itself until it's done"
+        )
+    elif intent == "programming":
+        intent_rules = (
+            "Intent is PROGRAMMING: explain like a smart friend, not a textbook.\n"
+            "Examples of good rhythm:\n"
+            "- okay so basically it keeps calling itself — that's its whole aura\n"
+            "- ngl this cooked me at first but the base case is the key fr\n"
+            "- no cap once you see the pattern it's actually a W\n"
+            "- the function is in its main character era — solving itself"
+        )
+    elif intent == "emotional_support":
+        intent_rules = (
+            "Intent is EMOTIONAL SUPPORT: present, not performative.\n"
+            "NO topic callbacks. NO references to prior conversation.\n"
+            "Examples of good rhythm:\n"
+            "- nah that's genuinely awful I'm so sorry 😭\n"
+            "- losing a pet hits different fr, take your time\n"
+            "- ngl that kind of loss is heavy, I'm here\n"
+            "- that's really rough no cap, how are you holding up"
+        )
+    elif intent == "jokes":
+        intent_rules = (
+            "Intent is JOKES: land it, don't explain it.\n"
+            "Examples of good rhythm:\n"
+            "- bro really said W and walked out 💀\n"
+            "- the aura on that is unmatched no cap\n"
+            "- that's bussin fr I won't lie"
+        )
+    else:
+        intent_rules = (
+            "Intent is GENERAL: casual conversation, keep it chill.\n"
+            "Pick whatever slang fits naturally from the dataset."
+        )
+
+    if selected_emoji:
+        emoji_instruction = (
+            f"SELECTED EMOJI: {selected_emoji}\n"
+            f"This emoji was chosen from the Gen-Z emoji dataset based on "
+            f"the emotion and content context.\n"
+            f"Use it AT MOST ONCE in the response if it fits naturally.\n"
+            f"If it does not fit, use NO emoji at all.\n"
+            f"NEVER add a different emoji — only use this one or none.\n"
+        )
+    else:
+        emoji_instruction = "Use NO emoji in this response.\n"
+
+    # Persona-specific tweak: roast, hype, vibe
+    persona_rules = ""
+    persona_name = "Vibe"
+    if persona == "roast":
+        persona_name = "Roast"
+        persona_rules = (
+            "PERSONA: Roast — playful, sarcastic, short burns only.\n"
+            "Be funny but never cruel: avoid personal attacks and sensitive topics.\n"
+            "Use at most one light roast and no emojis unless explicitly requested.\n"
+        )
+    elif persona == "hype":
+        persona_name = "Hype"
+        persona_rules = (
+            "PERSONA: Hype — energetic, encouraging, high-energy slang allowed.\n"
+            "Use 0-2 slang words and at most one emoji to boost energy.\n"
+        )
+    elif persona == "vibe":
+        persona_name = "Vibe"
+        persona_rules = (
+            "PERSONA: Vibe — chill, supportive, short and atmospheric.\n"
+            "Prefer 'lowkey' or 'aura' style slang; minimal emojis.\n"
         )
 
     prompt = (
-        "Rewrite the following response in authentic Gen-Z internet style.\n\n"
-        "STRICT RULES:\n"
-        "1. Gen-Z is a STYLE, not random word replacement. Avoid therapist energy.\n"
-        "2. Limit slang: Maximum 1 slang phrase per response (e.g. fr, lowkey, lock in, cooked, wild). NEVER stack many together.\n"
-        "3. Limit emoji: Maximum 1 emoji per response (Allowed: 😭 🔥 ✋ 💀 👀 👋). NEVER use the clown emoji (🤡). Only use if emotion matches.\n"
-        "4. NEVER say 'it's so great to hear from you', 'freaking out for u', or sound like a motivational poster.\n"
-        "5. NEVER overuse 'lowkey', 'nah cause', or 'fam'.\n"
-        "6. NEVER explain detected emotions.\n"
-        "7. Make responses short, texting-like, natural, with university student energy.\n\n"
+        "You are a Gen-Z style rewriter for a university student chatbot.\n\n"
+        "YOUR ONLY JOB: rewrite the response below so it sounds like a real "
+        "smart uni student texting a close friend.\n\n"
+
+        "HARD RULES:\n"
+        "1. Pick ONLY from the APPROVED SLANG DATASET below.\n"
+        "   Use AT MOST 1-2 slang terms. Must match sentence meaning.\n"
+        f"2. EMOJI RULE:\n{emoji_instruction}\n"
+        "HARD RULE: NEVER speak as if you are the user.\n"
+        "           Do NOT use first-person statements like 'I', 'I'm', 'I feel', or 'I need' to describe emotions or actions.\n"
+        "           Always address the user in second-person (you/your) when referring to their feelings or actions.\n"
+        "3. NEVER stack slang: 'ngl lowkey fr no cap' = cringe = fail.\n"
+        "4. NEVER reference prior topics during grief or emotional support.\n"
+        "5. NEVER use overly literary metaphors.\n"
+        "6. Keep it SHORT: 1-3 sentences unless technical.\n"
+        "7. Structure: short reaction → message → optional question.\n"
+        "8. Clarity before style. Explain cleanly first.\n"
+        "9. NEVER mention emotion labels or NLP analysis.\n"
+        "10. Sound HUMAN. If it sounds like an AI doing Gen-Z, rewrite it.\n"
+        "11. If the rewritten response does not already use approved slang, add one natural dataset term.\n"
+        "    Do NOT force slang if it breaks clarity or the emotional tone.\n\n"
+
         f"EMOTION CONTEXT:\n{emotion_rules}\n\n"
         f"INTENT CONTEXT:\n{intent_rules}\n\n"
-        "Here is some Gen-Z slang context retrieved from our knowledge base. "
-        "Use it as INSPIRATION ONLY — never copy the exact wording blindly:\n\n"
-        f"{retrieved_examples}\n\n"
-        "Text to rewrite:\n"
+
+        f"SLANG SEMANTIC GUIDE — read before choosing any slang term:\n"
+        f"{SLANG_USAGE_GUIDE}\n\n"
+
+        "APPROVED SLANG DATASET — meaning must match:\n"
+        f"{FULL_SLANG_PROMPT}\n\n"
+
+        "RETRIEVED STYLE EXAMPLES (rhythm only — never copy):\n"
+        f"{retrieved_examples}\n\n" +
+        (("FEW-SHOT SYNTHETIC EXAMPLES (NORMAL → GENZ):\n" + synthetic_examples + "\n\n") if synthetic_examples else "") +
+        f"{persona_rules}\n"
+        "RESPONSE TO REWRITE:\n"
         f"{groq_response}\n\n"
-        "Output ONLY the rewritten Gen-Z response, nothing else."
+        f"If you sign off, use the persona name: " + persona_name + ".\n\n"
+        "OUTPUT ONLY the rewritten response. No labels, no quotes."
     )
     return prompt
 
+
+def _fix_first_person_response(text: str) -> str:
+    """If the LLM replies as if it is the user (starts in first-person),
+    convert leading first-person to second-person to avoid role confusion.
+    This only applies to leading clauses (very conservative).
+    """
+    if not text:
+        return text
+
+    t = text.lstrip()
+    # common contractions and variants
+    patterns = [
+        (r"\bI['’]?m\b", "you're"),
+        (r"\bI'm\b", "you're"),
+        (r"\bIm\b", "you're"),
+        (r"\bI\b", "you"),
+        (r"\bi\b", "you"),
+        (r"\bI need\b", "you need"),
+        (r"\bI want\b", "you want"),
+        (r"\bI should\b", "you should"),
+        (r"\bI gotta\b", "you gotta"),
+        (r"\bI have to\b", "you have to"),
+        (r"\bI am going to\b", "you are going to"),
+        (r"\bI’m going to\b", "you're going to"),
+        (r"\bI was\b", "you were"),
+        (r"\bI feel\b", "you feel"),
+    ]
+    for pat, repl in patterns:
+        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+
+    # As a final catch-all, replace any remaining standalone first-person pronouns
+    # that might have been missed (very aggressive safeguard).
+    t = re.sub(r"\bI['’]?\b", "you", t)
+    t = re.sub(r"\bi\b", "you", t)
+
+    return t.strip() if t != text else text
 
 
 
@@ -334,40 +556,26 @@ def generate_response(
     emotion: str,
     sentiment: str,
     intent: str,
+    persona: str = None,
     history: list = None,
     tokens: list = None,
     emoji_emotions: list = None,
 ) -> str:
-    """
-    Generate a response using NLP analysis + Anthropic LLM.
 
-    Flow:
-      1. Grief detection (NLP rule, runs before LLM)
-      2. Build structured prompt from all NLP outputs
-      3. Call Anthropic LLM with that prompt
-      4. Post-process to strip leaked analysis language
-      5. Fallback to rule-based responses if API unavailable
-    """
     tokens         = tokens or []
     emoji_emotions = emoji_emotions or []
 
-    # ── 1. Grief check (NLP rule — highest priority) ──────────────────────
+    # ── 1. Grief check ────────────────────────────────────────
     is_grief = _detect_grief(message)
-    if is_grief:
-        # We handle grief via LLM prompt rules inside _build_system_prompt
-        pass
-        
-    # ── 1.5 Greeting Intent Bypass ─────────────────────────────────────────
-    if intent == "greeting":
-        import random
-        greetings = [
-            "yooo what's up 👋",
-            "heyy how's it going",
-            "ayo what we on today 😭"
-        ]
-        return random.choice(greetings)
 
-    # ── 2. Build system prompt from NLP outputs ───────────────────────────
+    # ── 2. Select emoji from dataset based on context ─────────
+    selected_emoji = get_emoji_for_context(
+        emotion=emotion,
+        intent=intent,
+        content_keywords=tokens,  # NLP tokens from pipeline
+    )
+
+    # ── 3. Build system prompt ────────────────────────────────
     system_prompt = _build_system_prompt(
         emotion        = emotion,
         sentiment      = sentiment,
@@ -378,36 +586,54 @@ def generate_response(
         history        = history,
     )
 
-    # ── 3. Pass 1: Generate Normal Response ───────────────────────────────
+    # ── 4. Pass 1: Generate base response ─────────────────────
     normal_response = generate_ai_response(system_prompt, message)
-    
+
     if not normal_response:
         return _fallback(emotion, intent, is_grief)
-        
-    # ── 4. Retrieve Context Examples ──────────────────────────────────────
+
+    # ── 5. Retrieve style examples ────────────────────────────
     examples_context = get_top_genz_examples(normal_response, top_n=5)
-    
-    # ── 5. Pass 2: Rewrite in Gen-Z Style ─────────────────────────────────
-    # The rewrite_genz function acts as the system prompt for the second LLM call,
-    # but it also includes the text to rewrite directly inside it. So we pass it as the user message.
+    # few-shot synthetic examples to nudge the rewriter
+    synthetic_examples = get_synthetic_examples(n=3)
+
+    # ── 6. Pass 2: Rewrite in Gen-Z style ─────────────────────
     rewrite_prompt_text = rewrite_genz(
-        groq_response=normal_response,
+        groq_response      = normal_response,
+        intent             = intent,
+        emotion            = emotion,
+        retrieved_examples = examples_context,
+        selected_emoji     = selected_emoji,   # pass it in
+        persona            = persona,
+        synthetic_examples = synthetic_examples,
+    )
+
+    genz_response = generate_ai_response(
+        "You are a Gen-Z translator. Output only the requested rewritten text.",
+        rewrite_prompt_text
+    )
+
+    if not genz_response:
+        genz_response = normal_response
+
+    # Final safeguard: if the rewrite did not use dataset slang, inject one natural term.
+    genz_response, slang_injected = apply_genz_translation(
+        genz_response,
+        REVERSE_SLANG_MAP,
+        force_use=True,
         intent=intent,
         emotion=emotion,
-        retrieved_examples=examples_context
+        tokens=tokens,
     )
-    
-    genz_response = generate_ai_response("You are a Gen Z translator. Output only the requested rewritten text.", rewrite_prompt_text)
-    
-    if not genz_response:
-        genz_response = normal_response # Fallback to normal if rewrite fails
-        
-    # ── 6. Cleanup & Final Post-process ───────────────────────────────────
-    clean_text = _postprocess(genz_response)
-    
-    # We no longer apply the manual slang translator (apply_genz_translation)
-    # because the RAG LLM pipeline now natively handles style transfer with strict limits.
-    return clean_text
 
-    # ── 5. Fallback (no API key or network error) ─────────────────────────
-    return _fallback(emotion, intent, is_grief)
+    # Prevent the bot from replying as if it is the user
+    fixed = _fix_first_person_response(genz_response)
+    sanitized = False
+    if fixed != genz_response:
+        print("[SANITIZE] first-person content rewritten to second-person")
+        genz_response = fixed
+        sanitized = True
+
+    final_text = _postprocess(genz_response)
+    meta = {"sanitized": sanitized, "slang_injected": slang_injected}
+    return final_text, meta

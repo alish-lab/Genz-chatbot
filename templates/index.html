@@ -5,26 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GenZBot ✨</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;800&family=Inter:wght@300;400;600&display=swap" rel="stylesheet" />
   <style>
     /* ─── Reset & base ─────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:        #0a0a0f;
-      --surface:   #111118;
-      --surface2:  #18181f;
-      --border:    #26263a;
-      --accent:    #7c5cfc;
-      --accent2:   #fc5c8a;
-      --accent3:   #5cfcd8;
-      --text:      #e8e8f0;
-      --muted:     #6b6b85;
-      --bot-bg:    #1a1a26;
-      --user-bg:   linear-gradient(135deg, #7c5cfc, #fc5c8a);
-      --radius:    18px;
+      --bg:        #0b0725;
+      --surface:   #110a2b;
+      --surface2:  #120a2f;
+      --border:    #2a2140;
+      --accent:    #8b63ff;
+      --accent2:   #6f4bff;
+      --text:      #efeefe;
+      --muted:     #a99df0;
+      --bot-bg:    #13081f;
+      --radius:    14px;
       --font-head: 'Syne', sans-serif;
-      --font-body: 'DM Sans', sans-serif;
+      --font-body: 'Inter', sans-serif;
     }
 
     html, body {
@@ -339,34 +337,30 @@
   <!-- Header -->
   <header class="header">
     <div class="logo">
-      <div class="logo-icon">🤖</div>
-      <div class="logo-text">GenZ<span>Bot</span></div>
+      <div class="logo-icon">💜</div>
+      <div class="logo-text">Vibe</div>
     </div>
-    <div class="status-dot" title="Online"></div>
+    <div style="width:8px"></div>
   </header>
 
   <!-- Mode bar -->
   <div class="mode-bar">
-    <button class="mode-btn active" data-mode="default">✨ Vibes</button>
-    <button class="mode-btn" data-mode="study">📚 Study Buddy</button>
-    <button class="mode-btn" data-mode="support">🫂 Support Mode</button>
-    <button class="mode-btn" data-mode="roast">💀 Roast Me</button>
-    <button class="mode-btn" data-mode="hype">🔥 Hype Mode</button>
+    <button class="mode-btn active" data-mode="vibe">Vibe</button>
+    <button class="mode-btn" data-mode="roast">Roast</button>
+    <button class="mode-btn" data-mode="hype">Hype</button>
   </div>
 
   <!-- Chat window -->
   <main class="chat-window" id="chatWindow">
     <div class="welcome" id="welcome">
       <div class="welcome-icon">✨</div>
-      <h2>Hey, I'm GenZBot!</h2>
-      <p>your AI bestie that actually gets you — slang, emojis, and all the vibes included fr fr</p>
+      <h2>Hey—I'm Vibe</h2>
+      <p>short, human replies. pick a mode and I'll match the tone.</p>
       <div class="starters">
-        <button class="starter" onclick="sendStarter(this)">what's good?? 👀</button>
-        <button class="starter" onclick="sendStarter(this)">help me study rn 📚</button>
-        <button class="starter" onclick="sendStarter(this)">tell me a joke lol</button>
-        <button class="starter" onclick="sendStarter(this)">I'm feeling kinda sad ngl</button>
-        <button class="starter" onclick="sendStarter(this)">help with my code 💻</button>
-        <button class="starter" onclick="sendStarter(this)">idk what to do today</button>
+        <button class="starter" onclick="sendStarter(this)">what's up?</button>
+        <button class="starter" onclick="sendStarter(this)">roast me</button>
+        <button class="starter" onclick="sendStarter(this)">hype me up</button>
+        <button class="starter" onclick="sendStarter(this)">vibe check</button>
       </div>
     </div>
   </main>
@@ -505,12 +499,11 @@
     isTyping = true;
     showTyping();
 
-    // Inject mode hint into message
+    // Inject mode hint into message (only vibe/roast/hype)
     let fullMessage = text;
-    if (currentMode === 'study')   fullMessage = 'help me study: ' + text;
-    if (currentMode === 'support') fullMessage = 'I need emotional support: ' + text;
-    if (currentMode === 'roast')   fullMessage = 'roast me: ' + text;
-    if (currentMode === 'hype')    fullMessage = 'hype me up: ' + text;
+    if (currentMode === 'roast') fullMessage = 'roast me: ' + text;
+    if (currentMode === 'hype')  fullMessage = 'hype me up: ' + text;
+    if (currentMode === 'vibe')  fullMessage = 'vibe: ' + text;
 
     try {
       const res = await fetch('/api/chat', {
