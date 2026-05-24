@@ -81,6 +81,6 @@ Supported emotion labels: `joy`, `sadness`, `anger`, `fear`, `surprise`, `neutra
 - `models/` contains generated artifacts and may be large
 - `data/chat_dataset.csv` is currently untracked and may contain additional training or chat data
 
-## License
+UI
+<img width="1223" height="832" alt="image" src="https://github.com/user-attachments/assets/6dfd3d7b-67be-4696-8ff6-26f55a43f638" />
 
-Include your license information here if applicable.
