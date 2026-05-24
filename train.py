@@ -21,11 +21,11 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"          # suppress TF noise
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout, Bidirectional
+from tensorflow.keras.layers import Embedding, LSTM, Dense, Dropout, Bidirectional, SpatialDropout1D
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -68,8 +68,8 @@ EMOTION_TEST  = _find_emotion_file("test.txt")
 
 # ── Hyper-parameters ─────────────────────────────────────────────────────────
 MAX_WORDS   = 10_000
-MAX_LEN     = 50
-EMBED_DIM   = 64
+MAX_LEN     = 80
+EMBED_DIM   = 100
 LSTM_UNITS  = 64
 BATCH_SIZE  = 32
 EPOCHS      = 15
@@ -78,6 +78,7 @@ EPOCHS      = 15
 EMOTION_TO_SENTIMENT = {
     "joy":      "positive",
     "surprise": "positive",
+    "love":     "positive",
     "sadness":  "negative",
     "anger":    "negative",
     "fear":     "negative",
@@ -210,54 +211,105 @@ def train_sentiment_lstm():
     print("  TRAINING: Sentiment Analysis LSTM")
     print("="*60)
 
-    train_x, train_y_emo, val_x, val_y_emo, test_x, test_y_emo = _load_all_emotion_data()
+    # Prefer using a dedicated chat sentiment dataset if available
+    chat_path = os.path.join(BASE_DIR, "data", "chat_dataset.csv")
+    texts, labels = [], []
+    chat_loaded = False
+    if os.path.exists(chat_path):
+        import csv
+        print(f"  Loading sentiment dataset from: {chat_path}")
+        with open(chat_path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                msg = row.get("message") or row.get("text") or row.get("tweet")
+                lab = row.get("sentiment") or row.get("label")
+                if not msg or not lab:
+                    continue
+                texts.append(_simple_clean(msg))
+                labels.append(lab.strip().lower())
+        chat_loaded = True
 
-    if not train_x:
-        print("[ERROR] No emotion data for sentiment training. Skipping.")
+    if not chat_loaded:
+        # Fallback: derive sentiment from emotion dataset only when chat dataset is unavailable.
+        train_x, train_y_emo, val_x, val_y_emo, test_x, test_y_emo = _load_all_emotion_data()
+        if not train_x:
+            print("[ERROR] No emotion data for sentiment training. Skipping.")
+            return
+        print("  Using derived sentiment labels from the emotion dataset")
+        def to_sentiment(labels_):
+            return [EMOTION_TO_SENTIMENT.get(l, "neutral") for l in labels_]
+        texts = train_x + val_x + test_x
+        labels = to_sentiment(train_y_emo + val_y_emo + test_y_emo)
+    else:
+        print("  Using chat dataset only for sentiment training to preserve neutral labels")
+
+    if not texts:
+        print("[ERROR] No sentiment data found. Skipping.")
         return
 
-    # Map emotion labels → sentiment labels
-    def to_sentiment(labels):
-        return [EMOTION_TO_SENTIMENT.get(l, "neutral") for l in labels]
+    # Normalize common label variants (pos/positive, neg/negative, neu/neutral)
+    def _normalize_label(lab: str) -> str:
+        lab = (lab or "").strip().lower()
+        if lab.startswith("pos"):
+            return "positive"
+        if lab.startswith("neg"):
+            return "negative"
+        if lab.startswith("neu") or lab in ("n", "neutral"):
+            return "neutral"
+        return lab
 
-    train_y = to_sentiment(train_y_emo)
-    val_y   = to_sentiment(val_y_emo)
-    test_y  = to_sentiment(test_y_emo)
+    labels = [_normalize_label(l) for l in labels]
 
+    # Create label encoder and split dataset
     le = LabelEncoder()
-    le.fit(["positive", "negative", "neutral"])
+    y = le.fit_transform(labels)
     num_classes = len(le.classes_)
-    print(f"  Sentiment classes: {list(le.classes_)}")
+    print(f"  Sentiment classes ({num_classes}): {list(le.classes_)}")
 
-    y_train_enc = to_categorical(le.transform(train_y), num_classes)
-    y_val_enc   = to_categorical(le.transform(val_y),   num_classes)
-    y_test_enc  = to_categorical(le.transform(test_y),  num_classes)
+    from sklearn.model_selection import train_test_split
+    X_train_texts, X_temp, y_train, y_temp = train_test_split(
+        texts, y, test_size=0.30, random_state=42, stratify=y
+    )
+    X_val_texts, X_test_texts, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+    )
+
+    # One-hot encode targets
+    y_train_enc = to_categorical(y_train, num_classes)
+    y_val_enc   = to_categorical(y_val,   num_classes)
+    y_test_enc  = to_categorical(y_test,  num_classes)
 
     # Class weights to handle imbalance
     from sklearn.utils.class_weight import compute_class_weight
-    cw = compute_class_weight("balanced", classes=np.unique(train_y),
-                              y=train_y)
+    cw = compute_class_weight("balanced", classes=np.unique(y), y=y)
     class_weights = {i: w for i, w in enumerate(cw)}
 
     tok = Tokenizer(num_words=MAX_WORDS, oov_token="<OOV>")
-    tok.fit_on_texts(train_x)
+    tok.fit_on_texts(X_train_texts)
 
-    X_train = pad_sequences(tok.texts_to_sequences(train_x), maxlen=MAX_LEN, padding="post", truncating="post")
-    X_val   = pad_sequences(tok.texts_to_sequences(val_x),   maxlen=MAX_LEN, padding="post", truncating="post")
-    X_test  = pad_sequences(tok.texts_to_sequences(test_x),  maxlen=MAX_LEN, padding="post", truncating="post")
+    X_train = pad_sequences(tok.texts_to_sequences(X_train_texts), maxlen=MAX_LEN, padding="post", truncating="post")
+    X_val   = pad_sequences(tok.texts_to_sequences(X_val_texts),   maxlen=MAX_LEN, padding="post", truncating="post")
+    X_test  = pad_sequences(tok.texts_to_sequences(X_test_texts),  maxlen=MAX_LEN, padding="post", truncating="post")
 
     model = Sequential([
         Embedding(MAX_WORDS, EMBED_DIM, input_length=MAX_LEN),
-        Bidirectional(LSTM(LSTM_UNITS)),
-        Dropout(0.3),
+        SpatialDropout1D(0.2),
+        Bidirectional(LSTM(LSTM_UNITS, dropout=0.2, recurrent_dropout=0.2)),
+        Dropout(0.4),
         Dense(32, activation="relu"),
+        Dropout(0.2),
         Dense(num_classes, activation="softmax"),
     ], name="sentiment_lstm")
 
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"],
+    )
     model.summary()
 
     es = EarlyStopping(monitor="val_loss", patience=4, restore_best_weights=True)
+    lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-5, verbose=1)
 
     model.fit(
         X_train, y_train_enc,
@@ -265,7 +317,7 @@ def train_sentiment_lstm():
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         class_weight=class_weights,
-        callbacks=[es],
+        callbacks=[es, lr],
         verbose=1,
     )
 
@@ -274,12 +326,15 @@ def train_sentiment_lstm():
     y_pred_prob = model.predict(X_test)
     y_pred = le.inverse_transform(np.argmax(y_pred_prob, axis=1))
 
-    acc = accuracy_score(test_y, y_pred)
+    # Convert encoded integer test labels back to string labels for reporting
+    y_test_labels = le.inverse_transform(y_test)
+
+    acc = accuracy_score(y_test_labels, y_pred)
     print(f"  Accuracy : {acc:.4f}")
     print("\n  Classification Report:")
-    print(classification_report(test_y, y_pred, target_names=le.classes_))
+    print(classification_report(y_test_labels, y_pred, target_names=le.classes_))
     print("\n  Confusion Matrix:")
-    print(confusion_matrix(test_y, y_pred, labels=le.classes_))
+    print(confusion_matrix(y_test_labels, y_pred, labels=le.classes_))
 
     # Save
     model.save(os.path.join(MODEL_DIR, "sentiment_rnn_model.h5"))
@@ -340,7 +395,39 @@ INTENT_DATA = [
     ("do you like music", "general"), ("what is your opinion on", "general"),
     ("let's talk", "general"), ("random question", "general"),
     ("what should i do today", "general"), ("i'm bored help", "general"),
+
+    # ADD THESE — short reactions that are NOT greetings
+    ("dude",                    "general"),
+    ("bro",                     "general"),
+    ("wait what",               "general"),
+    ("no way",                  "general"),
+    ("seriously",               "general"),
+    ("what",                    "general"),
+    ("omg",                     "general"),
+    ("oh wow",                  "general"),
+    ("okay but",                "general"),
+    ("actually",                "general"),
+
+    # More studying examples with quiz panic
+    ("i have a quiz tomorrow",  "studying"),
+    ("quiz in an hour",         "studying"),
+    ("i haven't studied",       "studying"),
+    ("i'm so unprepared",       "studying"),
+    ("i haven't studied at all","studying"),
+    ("test is today",           "studying"),
+    ("exam in an hour",         "studying"),
+    ("didn't study",            "studying"),
+    ("quiz today",              "studying"),
+
+    # More greeting variety
+    ("hi",                      "greeting"),
+    ("hey",                     "greeting"),
+    ("hello",                   "greeting"),
+    ("heyy",                    "greeting"),
+    ("yo",                      "greeting"),
+    ("sup",                     "greeting"),
 ]
+
 
 
 def train_intent_classifier():

@@ -1,550 +1,353 @@
-"""
-response_generator.py — LLM-powered Gen Z response generation for GenZBot
-────────────────────────────────────────────────────────────────────────────
-Architecture (NLP → LLM hybrid):
 
-  NLP pipeline outputs (emotion, sentiment, intent, tokens, emoji emotions)
-       ↓
-  Prompt engineer a rich, structured context
-       ↓
-  Anthropic Claude (claude-sonnet-4-20250514) generates the response
-       ↓
-  Post-process: strip analysis mentions, enforce tone rules
-       ↓
-  Final Gen Z response
-
-The LLM is NOT doing raw chatbot work — it receives the fully-processed NLP
-analysis and uses it to generate a contextually appropriate response.
-Grief detection, tone rules, and persona constraints are all enforced via
-the system prompt built from the NLP outputs.
-────────────────────────────────────────────────────────────────────────────
-"""
 
 import os
 import re
 import random
+import csv
 from dotenv import load_dotenv
-from preprocess import _load_slang_map, _build_reverse_slang_map, apply_genz_translation
-
-load_dotenv()
-
-SLANG_MAP = _load_slang_map()
-REVERSE_SLANG_MAP = _build_reverse_slang_map(SLANG_MAP)
-
 from groq_service import generate_ai_response
 from retrieval import get_top_genz_examples
 
-from preprocess import (
-    _load_slang_map,
-    _build_reverse_slang_map,
-    apply_genz_translation,
-    get_real_slang_for_prompt,
-    get_emoji_for_context,      # add this
-    get_synthetic_examples,
-)
+load_dotenv()
 
-# Load once at startup
-SLANG_MAP         = _load_slang_map()
-REVERSE_SLANG_MAP = _build_reverse_slang_map(SLANG_MAP)
-FULL_SLANG_PROMPT = get_real_slang_for_prompt()  # add this
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Grief / loss trigger phrases (NLP rule — runs before LLM)
+# Emoji safety — enforced in post-processing. Load full emoji dataset and
+# derive allowed set dynamically rather than using a small hardcoded set.
+# ─────────────────────────────────────────────────────────────────────────────
+BANNED_EMOJIS  = {
+    "🤬", "🤢", "🤮", "😰", "😨", "😧", "😦", "😧",
+    "🤰","🦦", "🧢", "💳", "🐸", "🌚", "🌝", 
+    "⏳", "🤪", "🙃", "👁️", "🧍", "🅱️", "🎷", "🦟", "🦗",
+}
+
+
+def _load_emoji_map() -> dict:
+    """Load genz_emojis.csv -> {emoji: description}."""
+    path = os.path.join(DATA_DIR, "genz_emojis.csv")
+    emap = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            # Accept common header names
+            for row in reader:
+                # try several common column names
+                emoji = row.get("emoji") or row.get("Emoji")
+                desc = row.get("description") or row.get("Description") or row.get("desc")
+                if emoji:
+                    emoji = emoji.strip()
+                    desc = (desc or "").strip()
+                    if emoji and emoji not in BANNED_EMOJIS:
+                        emap[emoji] = desc
+    except FileNotFoundError:
+        # Fallback small set
+        emap = {"😭": "crying", "🔥": "fire", "💀": "dead", "👀": "eyes"}
+    return emap
+
+
+EMOJI_MAP = _load_emoji_map()
+ALLOWED_EMOJIS = set(EMOJI_MAP.keys())
+
+
+def _load_slang_map() -> dict:
+    """Load genz_slang_dataset_final2020_2026.csv -> {slang: meaning}"""
+    path = os.path.join(DATA_DIR, "genz_slang_dataset_final2020_2026.csv")
+    smap = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                slang = (row.get("slang_term") or row.get("slang") or "").strip()
+                meaning = (row.get("meaning") or row.get("definition") or "").strip()
+                if slang and meaning:
+                    smap[slang] = meaning
+    except FileNotFoundError:
+        smap = {}
+    return smap
+
+
+SLANG_MAP = _load_slang_map()
+
+from difflib import SequenceMatcher
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _pick_emoji(message: str, emotion: str, tokens: list, emoji_emotions: list) -> str:
+    """Pick best emoji from EMOJI_MAP matching emotion, tokens or message content."""
+    message = (message or "").lower()
+    candidates = []
+    # prefer emojis explicitly linked to detected emoji_emotions
+    for e, emo in (emoji_emotions or []):
+        if e in EMOJI_MAP and e not in BANNED_EMOJIS:
+            return e
+
+    # score emojis by description match against emotion or message
+    for emoji, desc in EMOJI_MAP.items():
+        if emoji in BANNED_EMOJIS:
+            continue
+        desc_l = (desc or "").lower()
+        score = 0.0
+        if emotion and emotion.lower() in desc_l:
+            score += 0.6
+        # token overlap
+        for t in (tokens or []):
+            if t and t.lower() in desc_l:
+                score += 0.15
+        # similarity to message
+        score += 0.25 * _similarity(desc_l, message)
+        candidates.append((score, emoji))
+
+    candidates.sort(reverse=True)
+    if not candidates:
+        return None
+    top_score, top_emoji = candidates[0]
+    if top_score > 0.25:
+        return top_emoji
+    return None
+
+
+def _load_acronym_map() -> dict:
+    """Load slang.csv acronym -> expansion, then invert to expansion -> acronym."""
+    path = os.path.join(DATA_DIR, "slang.csv")
+    acronym_map = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                acr = (row.get("acronym") or "").strip().lower()
+                exp = (row.get("expansion") or "").strip().lower()
+                if acr and exp:
+                    acronym_map[exp] = acr
+    except FileNotFoundError:
+        acronym_map = {}
+    return acronym_map
+
+ACRONYM_MAP = _load_acronym_map()
+
+
+def _pick_slang(message: str, response: str, tokens: list) -> str:
+    """Return a slang term from SLANG_MAP whose meaning best matches the response/message.
+    Conservative: require minimum similarity threshold before choosing.
+    """
+    m = (message or "").lower()
+    r = (response or "").lower()
+    best = (0.0, None)
+    for slang, meaning in SLANG_MAP.items():
+        meaning_l = meaning.lower()
+        # prefer meanings that appear as substrings
+        if meaning_l and (meaning_l in r or meaning_l in m):
+            return slang
+        # otherwise use similarity against response
+        sim = _similarity(meaning_l, r)
+        if sim > best[0]:
+            best = (sim, slang)
+    if best[0] > 0.45:
+        return best[1]
+    return None
+
+
+def _apply_acronym_expansions(text: str) -> str:
+    """Replace longer expansion phrases in the text with known acronyms."""
+    if not ACRONYM_MAP:
+        return text
+    lowered = text.lower()
+    # prioritize longer expansions to avoid partial matches
+    expansions = sorted(ACRONYM_MAP.keys(), key=len, reverse=True)
+    for exp in expansions:
+        if exp in lowered:
+            acronym = ACRONYM_MAP[exp]
+            text = re.sub(rf"\b{re.escape(exp)}\b", acronym, text, flags=re.IGNORECASE)
+            lowered = text.lower()
+    return text
+
+
+def _sanitize_emojis(text: str) -> str:
+    # strip banned emojis
+    for emoji in BANNED_EMOJIS:
+        text = text.replace(emoji, "")
+    # keep only emojis that exist in our dataset
+    found = [e for e in ALLOWED_EMOJIS if e in text]
+    if len(found) > 1:
+        for extra in found[1:]:
+            text = text.replace(extra, "")
+    return text.strip()
+
+
+def _limit_slang(text: str) -> str:
+    if not SLANG_MAP:
+        return re.sub(r"  +", " ", text).strip()
+    lower = text.lower()
+    found = [slang for slang in SLANG_MAP.keys() if slang in lower]
+    if len(found) > 1:
+        # Keep the most specific / longest slang phrase and remove the rest.
+        found.sort(key=len, reverse=True)
+        keep = found[0]
+        for extra in found[1:]:
+            text = re.sub(rf"\b{re.escape(extra)}\b", "", text, flags=re.IGNORECASE)
+    return re.sub(r"  +", " ", text).strip()
+
+
+def _postprocess(text: str) -> str:
+    leaked = [
+        r"(?i)i (detected|noticed|saw|found) (that you|your)",
+        r"(?i)based on (your|the) (sentiment|emotion|intent|analysis)",
+        r"(?i)the (nlp|model|analysis) (detected|found|shows?)",
+    ]
+    for p in leaked:
+        text = re.sub(p, "", text)
+    text = re.sub(r"\*\*?(.+?)\*\*?", r"\1", text)
+    return re.sub(r"  +", " ", text).strip().lstrip(".,")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grief detection
 # ─────────────────────────────────────────────────────────────────────────────
 GRIEF_PHRASES = [
     "died", "passed away", "lost my cat", "lost my dog", "lost my mom",
-    "lost my dad", "lost my friend", "lost my pet", "lost my grandma",
-    "lost my grandpa", "funeral", "miss her", "miss him", "miss them",
-    "she passed", "he passed", "they passed", "gone forever",
-    "can't believe she's gone", "can't believe he's gone",
-    "death", "mourning", "grieving", "buried", "cremated",
-    "my dog died", "my cat died", "pet died", "someone died",
+    "lost my dad", "lost my pet", "lost my grandma", "lost my grandpa",
+    "funeral", "she passed", "he passed", "they passed", "death",
+    "mourning", "grieving", "my dog died", "my cat died",
 ]
 
 def _detect_grief(message: str) -> bool:
-    lowered = message.lower()
-    return any(phrase in lowered for phrase in GRIEF_PHRASES)
+    return any(p in message.lower() for p in GRIEF_PHRASES)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fallback responses (used when API is unavailable)
+# Fallbacks (used when API is unavailable / rate limited)
 # ─────────────────────────────────────────────────────────────────────────────
 FALLBACK = {
-    "grief":             ["I'm so sorry. That kind of loss is heavy and there's no rushing through it. I'm here whenever you need to talk.",
-                          "Losing someone you love changes things. Please give yourself the space to feel whatever you're feeling right now."],
-    "sadness":           ["hey, I see you. that sounds really hard. want to talk about it?",
-                          "ngl that sounds genuinely tough. you're not alone in this fr."],
-    "anger":             ["okay I hear you, that sounds genuinely frustrating. what happened?",
-                          "fr that sounds annoying. want to vent or do you want advice?"],
-    "fear":              ["hey, breathe. that sounds scary but you've got this, I promise.",
-                          "I totally get why that's nerve-wracking. let's think through it together."],
-    "joy":               ["okay WAIT this actually made my day 🔥 tell me more!!",
-                          "the energy you're bringing rn is immaculate ngl ✨"],
-    "studying":          ["okay study buddy mode: ACTIVATED 📚 what are we tackling?",
-                          "let's get this bread 📖 what subject are we conquering?"],
-    "programming":       ["okay I'm basically a rubber duck that can also code 🦆 what's the bug?",
-                          "debugging session commencing 💻 what language are we in?"],
-    "jokes":             ["why did the scarecrow win an award? because he was outstanding in his field 💀",
-                          "fun fact: otters hold hands when they sleep so they don't drift apart 🦦"],
-    "greeting":          ["hey!! what's the vibe today? ✨", "yo, what's good? 👀"],
-    "general":           ["okay that's actually interesting, go on 👀",
-                          "lowkey I have thoughts on this. what's your take?"],
+    "grief":    [
+        "i'm so sorry. that kind of loss is really heavy. i'm here if you want to talk.",
+        "losing someone you love changes everything. take all the time you need.",
+    ],
+    "sadness":  [
+        "hey, that sounds really hard 😭 want to talk about it?",
+        "ngl that sounds tough. you're not alone fr.",
+    ],
+    "anger":    [
+        "okay that sounds genuinely frustrating. what happened?",
+        "fr that's annoying. want to vent or nah?",
+    ],
+    "fear":     [
+        "hey breathe — you've got this 👀",
+        "that's nerve-wracking but let's think through it together.",
+    ],
+    "joy":      [
+        "okay that's actually amazing 🔥 tell me more!!",
+        "the energy you're bringing rn is immaculate ngl",
+    ],
+    "studying": [
+        "okay study buddy mode activated — what are we tackling?",
+        "let's lock in — what subject are we fighting?",
+    ],
+    "jokes":    [
+        "why did the scarecrow win an award? outstanding in his field 💀",
+        "fun fact: a group of flamingos is called a flamboyance. you're welcome.",
+    ],
+    "greeting": ["heyy what's the vibe", "yo what's good 👀"],
+    "general":  [
+        "okay that's actually interesting, go on 👀",
+        "lowkey have thoughts on this — what's your take?",
+    ],
 }
-
-SLANG_USAGE_GUIDE = """
-SLANG SEMANTIC RULES — only use a term if the meaning fits:
-
-say less    → means "understood, got it, no need to explain"
-             ONLY use when acknowledging something the user explained
-             NEVER use as a filler or question ending
-             WRONG: "what subject is it, say less?"
-             RIGHT: "say less, let's get into it"
-
-locked in   → means "fully focused, in the zone"
-             use when encouraging focus or study mode
-             RIGHT: "let's get locked in fr"
-
-cooked      → means "in trouble, overwhelmed, failed"
-             use when situation is bad or difficult
-             RIGHT: "we are so cooked for this exam 😭"
-
-lowkey      → means "subtly, quietly, a little bit"
-             use to soften an opinion
-             RIGHT: "lowkey recursion is actually interesting"
-
-ngl         → means "not gonna lie, being honest"
-             use before an honest opinion
-             RIGHT: "ngl that quiz sounds rough"
-
-fr          → means "for real, seriously"
-             use to emphasize something genuine
-             RIGHT: "that's tough fr"
-
-W           → means "win, good outcome"
-             use only for genuinely positive things
-             RIGHT: "that's actually a W"
-
-no cap      → means "no lie, seriously"
-             use to emphasize honesty
-             RIGHT: "no cap this is important"
-
-aura        → means "someone's vibe or energy"
-             use for personality or vibe descriptions
-             RIGHT: "the aura of recursion is just calling itself"
-
-cooked      → means "in trouble or overwhelmed"
-             RIGHT: "we're cooked if we don't start now"
-
-bet         → means "okay, sounds good, agreed"
-             use as affirmation
-             RIGHT: "bet, let's do this"
-"""
 
 def _fallback(emotion: str, intent: str, is_grief: bool) -> str:
     if is_grief:
         return random.choice(FALLBACK["grief"])
-    if emotion in FALLBACK:
-        return random.choice(FALLBACK[emotion])
-    if intent in FALLBACK:
-        return random.choice(FALLBACK[intent])
-    return random.choice(FALLBACK["general"])
+    return random.choice(
+        FALLBACK.get(emotion) or FALLBACK.get(intent) or FALLBACK["general"]
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompt builder — turns NLP outputs into a structured LLM prompt
+# Tone and intent lookup tables (replaces long if/elif chains)
+# ─────────────────────────────────────────────────────────────────────────────
+_TONE = {
+    "sadness":  "comforting and gentle — no hype or jokes",
+    "anger":    "calm and listen-first — acknowledge frustration first",
+    "fear":     "reassuring and grounded — 'you've got this' energy",
+    "joy":      "enthusiastic and fun — match their energy",
+    "surprise": "enthusiastic and fun — match their energy",
+    "neutral":  "chill and conversational",
+}
+
+_INTENT_HINT = {
+    "studying":          "be a study buddy — helpful and encouraging. Ask what topic ONLY if not already in history.",
+    "programming":       "be a debug buddy — technical and helpful. Ask language/error only if not given.",
+    "jokes":             "deliver ONE short joke or fun fact then stop — no rambling after the punchline.",
+    "greeting":          "be warm and brief — 1 sentence, ask what's on their mind.",
+    "emotional_support": "be present and empathetic — validate first, no rushing to solutions.",
+    "general":           "engage with what they said directly — respond to content, don't just ask follow-ups.",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compact single-pass prompt builder (~300 tokens target)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_system_prompt(emotion: str, sentiment: str, intent: str,
-                          is_grief: bool, emoji_emotions: list,
-                          tokens: list, history: list = None) -> str:
-    """
-    Build a system prompt that encodes all NLP analysis results as
-    explicit behavioral constraints for the LLM.
-    """
-
-    # ── Core persona ───────────────────────────────────────────────────────
-    persona = """You are an empathetic, helpful AI bestie.
-    You were built on a full NLP pipeline: your understanding of this message
-    comes from emotion detection, sentiment analysis, intent classification,
-    slang normalization, acronym expansion, and emoji interpretation.
-    Use that understanding — not surface-level keyword matching — to respond."""
-
-    # ── Tone rules derived from NLP outputs ───────────────────────────────
-    tone_rules = []
+def _build_prompt(
+    message: str,
+    emotion: str,
+    intent: str,
+    is_grief: bool,
+    history: list,
+    examples: str,
+) -> tuple:
+    """Returns (system_prompt, user_message)."""
 
     if is_grief:
-        tone_rules += [
-            "The user is experiencing grief or loss. This overrides everything.",
-            "DO NOT use Gen Z slang, hype language, or emojis.",
-            "Respond like a compassionate, quiet friend — warm, short, human.",
-            "Do not try to fix anything. Just acknowledge and be present.",
-        ]
-    elif emotion == "sadness":
-        tone_rules += [
-            "The NLP model detected SADNESS. Be comforting and validating.",
-            "Use gentle, natural language. Light Gen Z tone is okay but no excessive hype.",
-            "Do not minimize their feelings. Make them feel heard.",
-        ]
-    elif emotion == "fear":
-        tone_rules += [
-            "The NLP model detected FEAR or ANXIETY. Be reassuring.",
-            "Ground them gently. 'You've got this' energy.",
-            "Keep it calm and steady.",
-        ]
-    elif emotion in ("joy", "surprise"):
-        tone_rules += [
-            "The NLP model detected JOY or positive energy. Match it!",
-            "Be enthusiastic, fun, upbeat.",
-            "Use standard English. Your response will be translated to slang later.",
-        ]
-    elif emotion == "anger":
-        tone_rules += [
-            "The user expressed frustration or anger. Stay calm and SHORT.",
-            "Do NOT lecture or moralize.",
-            "Do NOT reference previous topics.",
-            "1-2 sentences max. Acknowledge and move on.",
-        ]
-    else:
-        tone_rules += [
-            "Tone is NEUTRAL. Be conversational and natural.",
-            "Adapt based on what the user actually said.",
-        ]
-
-    # ── Intent-specific behavior ───────────────────────────────────────────
-    intent_rules = []
-    if intent == "studying":
-        intent_rules += [
-            "The user wants STUDY HELP. Become their study buddy.",
-            "Be helpful, clear, and encouraging. Use structured explanations.",
-            "Prioritize being useful and clear.",
-        ]
-    elif intent == "programming":
-        intent_rules += [
-            "The user needs PROGRAMMING HELP. Be technical and helpful.",
-            "Ask clarifying questions if needed (language, error, context).",
-            "Rubber duck energy — help them think through it.",
-        ]
-    elif intent == "jokes":
-        intent_rules += [
-            "The user wants something FUNNY. Deliver a joke, meme reference, or fun fact.",
-            "Be genuinely funny, not corny (or be intentionally corny and own it).",
-        ]
-    elif intent == "greeting":
-        intent_rules += [
-            "The user is GREETING you. Respond warmly and with good energy.",
-            "Ask what's on their mind or how their day is going.",
-        ]
-    elif intent == "emotional_support":
-        intent_rules += [
-            "The user needs EMOTIONAL SUPPORT. Be present and empathetic.",
-            "Don't rush to solutions. Listen and validate first.",
-        ]
-
-    # ── Emoji context from NLP ─────────────────────────────────────────────
-    emoji_context = ""
-    if emoji_emotions:
-        emoji_str = ", ".join(f"{e} ({emo})" for e, emo in emoji_emotions)
-        emoji_context = f"\nEmoji signals detected by NLP pipeline: {emoji_str}"
-        emoji_context += "\nFactor this emotional context into your response."
-
-    # ── Key tokens from NLP ────────────────────────────────────────────────
-    token_context = ""
-    if tokens:
-        token_context = f"\nKey semantic tokens extracted: {', '.join(tokens[:12])}"
-
-    # ── Hard rules (always enforced) ──────────────────────────────────────
-    hard_rules = [
-      
-        "NEVER mention emotion labels, sentiment scores, or intent classifications.",
-        "NEVER say 'I detected that you are...' or 'Based on your sentiment...'",
-        "NEVER drag the conversation back to a previous topic the user has moved on from.",
-        "NEVER reference recursion, studying, or any prior topic unless the user brings it up.",
-        "If the user says something unrelated to the previous topic, just respond to what they said.",
-        "NEVER be robotic or formal unless explaining something technical.",
-        "Keep responses 1 to 4 sentences max unless explaining something complex.",
-        "Write in clear standard English. The response will be styled afterward.",
-        "Use 0 to 2 emojis max.",
-        "Sound like a real person. Not a tutor. Not a therapist. A smart friend.",
-        "If the user expresses frustration or anger toward you, stay calm and brief. Do not lecture.",
-        "If the user talks about their social life, friends, or personal life, engage with THAT topic.",
-        "NEVER speak as if you ARE the user. You are responding TO the user.",
-        "NEVER say 'I have a quiz' or 'I need help' — those are the user's words not yours.",
-        "NEVER start a response with 'I' unless you are expressing your own opinion.",
-        "NEVER repeat back what the user said as if it is your own situation.",
-        "You are an AI assistant responding to the user. Always maintain that perspective.",
-    ]
-    
-
-    # ── Assemble ──────────────────────────────────────────────────────────
-    system = persona + "\n\n"
-    system += "NLP Analysis Results:\n"
-    system += f"  • Detected emotion  : {emotion}\n"
-    system += f"  • Detected sentiment: {sentiment}\n"
-    system += f"  • Detected intent   : {intent}\n"
-    if emoji_context:
-        system += emoji_context + "\n"
-    if token_context:
-        system += token_context + "\n"
-        
-    if history:
-        system += "\nConversation History (for context):\n"
-        for i, msg in enumerate(history[-5:]):
-            system += f"  - [{i+1}] {msg}\n"
-        system += "\nNote: Factor the above context into your response so you don't repeat yourself or misunderstand follow-ups.\n"
-
-    system += "\n\nTone Rules (derived from NLP analysis):\n"
-    for rule in tone_rules:
-        system += f"  - {rule}\n"
-
-    if intent_rules:
-        system += "\nIntent-specific Rules:\n"
-        for rule in intent_rules:
-            system += f"  - {rule}\n"
-
-    system += "\nHard Rules (always apply):\n"
-    for rule in hard_rules:
-        system += f"  - {rule}\n"
-
-    return system
-
-def rewrite_genz(
-    groq_response: str,
-    intent: str,
-    emotion: str,
-    retrieved_examples: str,
-    selected_emoji: str = "",       # add this
-    persona: str = None,
-    synthetic_examples: str = "",
-) -> str:
-
-    emotion_rules = ""
-    if emotion == "sadness":
-        emotion_rules = (
-            "Emotion is SAD or GRIEF: be human first, drop everything else.\n"
-            "NO slang. NO emoji except 😭 if it fits naturally.\n"
-            "Short, warm, real. Sound like a friend who actually cares."
+        system = (
+            "You are a compassionate, quiet friend. "
+            "The user is grieving. Respond warmly and briefly in 2 sentences max. "
+            "No slang. No emojis. Just be present and human."
         )
-    elif emotion == "anger":
-        emotion_rules = (
-            "Emotion is ANGER: validate first, stay calm.\n"
-            "No jokes. No hype. Pick grounding slang only if natural: fr, ngl, deadass."
-        )
-    elif emotion in ("joy", "surprise"):
-        emotion_rules = (
-            "Emotion is JOY: match the energy.\n"
-            "Pick high-energy slang from the dataset: W, bussin, slay, goated, no cap, fire.\n"
-            "Pair with 🔥 or 💀 only if it genuinely fits."
-        )
-    elif emotion == "fear":
-        emotion_rules = (
-            "Emotion is STRESS/FEAR: calm and reassuring tone.\n"
-            "Pick grounding slang: lowkey, ngl, locked in, fr, clutch.\n"
-            "Slightly humorous only if it eases tension naturally."
-        )
-    else:
-        emotion_rules = (
-            "Emotion is NEUTRAL: casual smart-friend energy.\n"
-            "Pick any slang from the dataset that fits the sentence meaning.\n"
-            "Never pick slang just to seem Gen-Z — it must fit naturally."
-        )
+        return system, message
 
-    intent_rules = ""
-    if intent == "greeting":
-        intent_rules = (
-            "Intent is GREETING: 1 sentence max, punchy opener.\n"
-            "Examples of good rhythm:\n"
-            "- ayo what's the vibe today 👀\n"
-            "- okay bet, what are we on\n"
-            "- heyy what's good fr"
-        )
-    elif intent == "studying":
-        intent_rules = (
-            "Intent is STUDYING: study buddy energy. Clear explanation first, Gen-Z second.\n"
-            "Examples of good rhythm:\n"
-            "- ngl recursion is actually a W concept once it clicks\n"
-            "- okay so the base case is literally the only exit, no cap\n"
-            "- we are so locked in rn 😭 what part is cooked for you\n"
-            "- lowkey once you see the pattern it all makes sense fr\n"
-            "- the aura of recursion is just calling itself until it's done"
-        )
-    elif intent == "programming":
-        intent_rules = (
-            "Intent is PROGRAMMING: explain like a smart friend, not a textbook.\n"
-            "Examples of good rhythm:\n"
-            "- okay so basically it keeps calling itself — that's its whole aura\n"
-            "- ngl this cooked me at first but the base case is the key fr\n"
-            "- no cap once you see the pattern it's actually a W\n"
-            "- the function is in its main character era — solving itself"
-        )
-    elif intent == "emotional_support":
-        intent_rules = (
-            "Intent is EMOTIONAL SUPPORT: present, not performative.\n"
-            "NO topic callbacks. NO references to prior conversation.\n"
-            "Examples of good rhythm:\n"
-            "- nah that's genuinely awful I'm so sorry 😭\n"
-            "- losing a pet hits different fr, take your time\n"
-            "- ngl that kind of loss is heavy, I'm here\n"
-            "- that's really rough no cap, how are you holding up"
-        )
-    elif intent == "jokes":
-        intent_rules = (
-            "Intent is JOKES: land it, don't explain it.\n"
-            "Examples of good rhythm:\n"
-            "- bro really said W and walked out 💀\n"
-            "- the aura on that is unmatched no cap\n"
-            "- that's bussin fr I won't lie"
-        )
-    else:
-        intent_rules = (
-            "Intent is GENERAL: casual conversation, keep it chill.\n"
-            "Pick whatever slang fits naturally from the dataset."
-        )
+    tone     = _TONE.get(emotion, "chill and conversational")
+    hint     = _INTENT_HINT.get(intent, "be helpful and conversational")
 
-    if selected_emoji:
-        emoji_instruction = (
-            f"SELECTED EMOJI: {selected_emoji}\n"
-            f"This emoji was chosen from the Gen-Z emoji dataset based on "
-            f"the emotion and content context.\n"
-            f"Use it AT MOST ONCE in the response if it fits naturally.\n"
-            f"If it does not fit, use NO emoji at all.\n"
-            f"NEVER add a different emoji — only use this one or none.\n"
-        )
-    else:
-        emoji_instruction = "Use NO emoji in this response.\n"
+    # History — only last 3 messages, compact format
+    history_block = ""
+    if len(history) > 1:
+        recent = history[-3:]
+        history_block = "History: " + " → ".join(f'"{m}"' for m in recent) + "\n"
 
-    # Persona-specific tweak: roast, hype, vibe
-    persona_rules = ""
-    persona_name = "Vibe"
-    if persona == "roast":
-        persona_name = "Roast"
-        persona_rules = (
-            "PERSONA: Roast — playful, sarcastic, short burns only.\n"
-            "Be funny but never cruel: avoid personal attacks and sensitive topics.\n"
-            "Use at most one light roast and no emojis unless explicitly requested.\n"
-        )
-    elif persona == "hype":
-        persona_name = "Hype"
-        persona_rules = (
-            "PERSONA: Hype — energetic, encouraging, high-energy slang allowed.\n"
-            "Use 0-2 slang words and at most one emoji to boost energy.\n"
-        )
-    elif persona == "vibe":
-        persona_name = "Vibe"
-        persona_rules = (
-            "PERSONA: Vibe — chill, supportive, short and atmospheric.\n"
-            "Prefer 'lowkey' or 'aura' style slang; minimal emojis.\n"
-        )
+    # Examples — only first 2, trimmed
+    examples_block = ""
+    if examples and "No" not in examples:
+        lines = [l for l in examples.strip().split("\n\n") if l.strip()][:2]
+        if lines:
+            examples_block = "Style refs:\n" + "\n".join(lines) + "\n"
 
-    prompt = (
-        "You are a Gen-Z style rewriter for a university student chatbot.\n\n"
-        "YOUR ONLY JOB: rewrite the response below so it sounds like a real "
-        "smart uni student texting a close friend.\n\n"
+    # We do not enumerate the entire emoji set in the prompt to avoid huge prompts.
+    # Instruct the model to pick at most one emoji from the dataset (dataset-driven),
+    # and explicitly forbid the banned set.
+    allowed = "one emoji from the dataset (avoid banned emojis)"
 
-        "HARD RULES:\n"
-        "1. Pick ONLY from the APPROVED SLANG DATASET below.\n"
-        "   Use AT MOST 1-2 slang terms. Must match sentence meaning.\n"
-        f"2. EMOJI RULE:\n{emoji_instruction}\n"
-        "HARD RULE: NEVER speak as if you are the user.\n"
-        "           Do NOT use first-person statements like 'I', 'I'm', 'I feel', or 'I need' to describe emotions or actions.\n"
-        "           Always address the user in second-person (you/your) when referring to their feelings or actions.\n"
-        "3. NEVER stack slang: 'ngl lowkey fr no cap' = cringe = fail.\n"
-        "4. NEVER reference prior topics during grief or emotional support.\n"
-        "5. NEVER use overly literary metaphors.\n"
-        "6. Keep it SHORT: 1-3 sentences unless technical.\n"
-        "7. Structure: short reaction → message → optional question.\n"
-        "8. Clarity before style. Explain cleanly first.\n"
-        "9. NEVER mention emotion labels or NLP analysis.\n"
-        "10. Sound HUMAN. If it sounds like an AI doing Gen-Z, rewrite it.\n"
-        "11. If the rewritten response does not already use approved slang, add one natural dataset term.\n"
-        "    Do NOT force slang if it breaks clarity or the emotional tone.\n\n"
-
-        f"EMOTION CONTEXT:\n{emotion_rules}\n\n"
-        f"INTENT CONTEXT:\n{intent_rules}\n\n"
-
-        f"SLANG SEMANTIC GUIDE — read before choosing any slang term:\n"
-        f"{SLANG_USAGE_GUIDE}\n\n"
-
-        "APPROVED SLANG DATASET — meaning must match:\n"
-        f"{FULL_SLANG_PROMPT}\n\n"
-
-        "RETRIEVED STYLE EXAMPLES (rhythm only — never copy):\n"
-        f"{retrieved_examples}\n\n" +
-        (("FEW-SHOT SYNTHETIC EXAMPLES (NORMAL → GENZ):\n" + synthetic_examples + "\n\n") if synthetic_examples else "") +
-        f"{persona_rules}\n"
-        "RESPONSE TO REWRITE:\n"
-        f"{groq_response}\n\n"
-        f"If you sign off, use the persona name: " + persona_name + ".\n\n"
-        "OUTPUT ONLY the rewritten response. No labels, no quotes."
+    system = (
+        "You are GenZBot — an empathetic AI bestie who texts like a Gen Z university student.\n"
+        f"emotion={emotion} | intent={intent} | tone: {tone}\n"
+        f"task: {hint}\n"
+        f"{history_block}"
+        f"{examples_block}"
+        "RULES:\n"
+        "• 1-3 sentences, lowercase, no ending periods\n"
+        f"• MAX 1 slang term from the dataset OR none\n"
+        f"• MAX 1 emoji: choose at most one emoji from the project's emoji dataset — or none. NEVER use banned or unlisted emojis\n"
+        "• NEVER stack slang (e.g. 'locked in no cap say less' = violation)\n"
+        "• NEVER mention emotions/NLP/analysis\n"
+        "• NEVER invent context not in the message\n"
+        "• NEVER repeat a question already asked in history\n"
+        "• Sound like a real person, not a motivational poster\n"
     )
-    return prompt
 
-
-def _fix_first_person_response(text: str) -> str:
-    """If the LLM replies as if it is the user (starts in first-person),
-    convert leading first-person to second-person to avoid role confusion.
-    This only applies to leading clauses (very conservative).
-    """
-    if not text:
-        return text
-
-    t = text.lstrip()
-    # common contractions and variants
-    patterns = [
-        (r"\bI['’]?m\b", "you're"),
-        (r"\bI'm\b", "you're"),
-        (r"\bIm\b", "you're"),
-        (r"\bI\b", "you"),
-        (r"\bi\b", "you"),
-        (r"\bI need\b", "you need"),
-        (r"\bI want\b", "you want"),
-        (r"\bI should\b", "you should"),
-        (r"\bI gotta\b", "you gotta"),
-        (r"\bI have to\b", "you have to"),
-        (r"\bI am going to\b", "you are going to"),
-        (r"\bI’m going to\b", "you're going to"),
-        (r"\bI was\b", "you were"),
-        (r"\bI feel\b", "you feel"),
-    ]
-    for pat, repl in patterns:
-        t = re.sub(pat, repl, t, flags=re.IGNORECASE)
-
-    # As a final catch-all, replace any remaining standalone first-person pronouns
-    # that might have been missed (very aggressive safeguard).
-    t = re.sub(r"\bI['’]?\b", "you", t)
-    t = re.sub(r"\bi\b", "you", t)
-
-    return t.strip() if t != text else text
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Groq API call
-# ─────────────────────────────────────────────────────────────────────────────
-
-# The LLM API call logic has been refactored into groq_service.py
-# which handles caching, debouncing, exponential backoff retries, and errors.
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Post-processing — strip any leaked analysis language
-# ─────────────────────────────────────────────────────────────────────────────
-
-_LEAKED_PATTERNS = [
-    r"(?i)i (detected|noticed|saw|found) (that you|your)",
-    r"(?i)based on (your|the) (sentiment|emotion|intent|analysis)",
-    r"(?i)(emotion|sentiment|intent)\s*[:=]\s*\w+",
-    r"(?i)the (nlp|model|analysis) (detected|found|shows?)",
-    r"(?i)according to (my analysis|the analysis|nlp)",
-]
-
-def _postprocess(text: str) -> str:
-    """Remove any leaked analytical language from LLM output."""
-    for pattern in _LEAKED_PATTERNS:
-        text = re.sub(pattern, "", text)
-    text = re.sub(r"  +", " ", text).strip()
-    text = re.sub(r"^[,.\s]+", "", text)
-    return text
+    return system, message
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,84 +359,87 @@ def generate_response(
     emotion: str,
     sentiment: str,
     intent: str,
-    persona: str = None,
     history: list = None,
     tokens: list = None,
     emoji_emotions: list = None,
 ) -> str:
-
+    history        = history or []
     tokens         = tokens or []
     emoji_emotions = emoji_emotions or []
 
-    # ── 1. Grief check ────────────────────────────────────────
+    # ── 1. Grief check ────────────────────────────────────────────────────────
     is_grief = _detect_grief(message)
 
-    # ── 2. Select emoji from dataset based on context ─────────
-    selected_emoji = get_emoji_for_context(
-        emotion=emotion,
-        intent=intent,
-        content_keywords=tokens,  # NLP tokens from pipeline
+    # ── 2. Greeting bypass — no API call needed ───────────────────────────────
+    if intent == "greeting" and not is_grief:
+        return random.choice([
+            "sup bestie👋",
+            "Hey Buddy👋",
+            "yo yo yo! what's poppin",
+            "Hey Dude"
+            "heyy what's the vibe",
+            "yo what's good 👀",
+            "hey!! what we on today",
+            "ayo what's up 😭",
+
+        ])
+
+    # ── 3. RAG — retrieve style examples ─────────────────────────────────────
+    examples = ""
+    if not is_grief:
+        examples = get_top_genz_examples(message, top_n=3)
+
+    # ── 4. Build compact single-pass prompt ───────────────────────────────────
+    system_prompt, user_msg = _build_prompt(
+        message  = message,
+        emotion  = emotion,
+        intent   = intent,
+        is_grief = is_grief,
+        history  = history,
+        examples = examples,
     )
 
-    # ── 3. Build system prompt ────────────────────────────────
-    system_prompt = _build_system_prompt(
-        emotion        = emotion,
-        sentiment      = sentiment,
-        intent         = intent,
-        is_grief       = is_grief,
-        emoji_emotions = emoji_emotions,
-        tokens         = tokens,
-        history        = history,
-    )
+    # ── 5. Single API call ────────────────────────────────────────────────────
+    print(f"[GEN] intent={intent} emotion={emotion} grief={is_grief}")
+    response = generate_ai_response(system_prompt, user_msg)
+    print(f"[GEN] {'OK: ' + repr(response[:60]) if response else 'FAILED — using fallback'}")
 
-    # ── 4. Pass 1: Generate base response ─────────────────────
-    normal_response = generate_ai_response(system_prompt, message)
-
-    if not normal_response:
+    if not response:
         return _fallback(emotion, intent, is_grief)
 
-    # ── 5. Retrieve style examples ────────────────────────────
-    examples_context = get_top_genz_examples(normal_response, top_n=5)
-    # few-shot synthetic examples to nudge the rewriter
-    synthetic_examples = get_synthetic_examples(n=3)
+    # ── 6. Post-processing ────────────────────────────────────────────────────
+    clean = _postprocess(response)
 
-    # ── 6. Pass 2: Rewrite in Gen-Z style ─────────────────────
-    rewrite_prompt_text = rewrite_genz(
-        groq_response      = normal_response,
-        intent             = intent,
-        emotion            = emotion,
-        retrieved_examples = examples_context,
-        selected_emoji     = selected_emoji,   # pass it in
-        persona            = persona,
-        synthetic_examples = synthetic_examples,
-    )
+    if not is_grief:
+        clean = _limit_slang(clean)
+        clean = _apply_acronym_expansions(clean)
+        clean = _sanitize_emojis(clean)
 
-    genz_response = generate_ai_response(
-        "You are a Gen-Z translator. Output only the requested rewritten text.",
-        rewrite_prompt_text
-    )
+    # Attempt dataset-driven emoji selection and slang injection
+    chosen_emoji = None
+    if not is_grief:
+        chosen_emoji = _pick_emoji(message, emotion, tokens, emoji_emotions)
 
-    if not genz_response:
-        genz_response = normal_response
+    # If intent is jokes and emoji matches 'laugh' or 'fun', allow single-emoji reply
+    if chosen_emoji and intent == "jokes":
+        desc = (EMOJI_MAP.get(chosen_emoji) or "").lower()
+        if any(k in desc for k in ("laugh", "lol", "fun", "haha", "joy", "happy")):
+            return chosen_emoji
 
-    # Final safeguard: if the rewrite did not use dataset slang, inject one natural term.
-    genz_response, slang_injected = apply_genz_translation(
-        genz_response,
-        REVERSE_SLANG_MAP,
-        force_use=True,
-        intent=intent,
-        emotion=emotion,
-        tokens=tokens,
-    )
+    # If response is empty or very short, but emoji is strong match, return emoji-only
+    if chosen_emoji and (len(clean) <= 8 or not clean.strip()):
+        return chosen_emoji
 
-    # Prevent the bot from replying as if it is the user
-    fixed = _fix_first_person_response(genz_response)
-    sanitized = False
-    if fixed != genz_response:
-        print("[SANITIZE] first-person content rewritten to second-person")
-        genz_response = fixed
-        sanitized = True
+    # If no emoji present in generated text, append the chosen emoji
+    if chosen_emoji and not any(e in clean for e in ALLOWED_EMOJIS):
+        clean = f"{clean} {chosen_emoji}".strip()
 
-    final_text = _postprocess(genz_response)
-    meta = {"sanitized": sanitized, "slang_injected": slang_injected}
-    return final_text, meta
+    # Slang injection: replace or append a single slang term if meaningful
+    if SLANG_MAP:
+        slang_choice = _pick_slang(message, clean, tokens)
+        if slang_choice:
+            # Append the slang term if not already present
+            if slang_choice not in clean.lower():
+                clean = f"{clean} {slang_choice}".strip()
+
+    return clean

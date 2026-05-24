@@ -402,6 +402,36 @@ def expand_acronyms(text: str) -> str:
     return " ".join(expanded)
 
 
+def contract_expansions(text: str) -> str:
+    """
+    Replace expansions with their acronyms using `slang.csv`.
+    Example: 'acknowledge' -> 'ack'. Performs longest-match first
+    and uses word boundaries to avoid partial replacements.
+    """
+    if not text:
+        return text
+
+    # Build a normalized expansion -> acronym map
+    reverse = {}
+    for acr, exp in ACRONYM_MAP.items():
+        if not exp:
+            continue
+        norm = re.sub(r"[^\w\s']", " ", exp.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if not norm:
+            continue
+        # prefer first-seen acronym for a given expansion
+        if norm not in reverse:
+            reverse[norm] = acr
+
+    # Replace longest expansions first to avoid partial matches
+    for expansion in sorted(reverse.keys(), key=len, reverse=True):
+        pattern = r"\b" + re.escape(expansion) + r"\b"
+        text = re.sub(pattern, reverse[expansion], text, flags=re.IGNORECASE)
+
+    return text
+
+
 def tokenize(text: str) -> list:
     """Simple whitespace tokenizer."""
     return text.split()
@@ -435,8 +465,8 @@ def run_pipeline(raw_text: str) -> dict:
     # Step 4: Slang normalization
     text = normalize_slang(text)
 
-    # Step 5: Acronym expansion
-    text = expand_acronyms(text)
+    # Step 5: Replace expansions with acronyms (e.g., 'acknowledge' -> 'ack')
+    text = contract_expansions(text)
 
     # Step 6: Tokenization
     tokens = tokenize(text)
